@@ -15,7 +15,8 @@ docker compose up --build
 
 This starts Postgres, the bank simulator (`bank_sim/`, unchanged from legacy) and the app on `:8000`.
 On first start the app creates the tables and seeds the admin account (`admin` / `admin123`),
-two coupons and the sample products. The build needs no manual steps, and the image runs with no network access.
+two coupons and the sample products. `shopcore serve` applies the migrations and seeds by itself (both idempotent), so the
+image also works when run directly without the compose command. The build needs no manual steps, and the image runs with no network access.
 
 If ports 8000 or 5001 are already in use: `APP_PORT=18000 BANK_PORT=15001 docker compose up --build`.
 

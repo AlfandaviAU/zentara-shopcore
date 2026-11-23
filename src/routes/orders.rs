@@ -140,20 +140,7 @@ pub async fn create(
         coupon = Some(c);
     }
 
-    // order_no comes from a sequence (migration 002): unique without serialising orders
-    let (oid, order_no): (i32, i32) = sqlx::query_as(
-        "INSERT INTO orders (order_no, user_id, status, total, paid_amount, refunded, coupon, notify_url, created_at) \
-         VALUES (nextval('orders_order_no_seq')::int, $1, 'pending', 0, 0, 0, $2, $3, (now() AT TIME ZONE 'UTC')) \
-         RETURNING id, order_no",
-    )
-    .bind(user.id)
-    .bind(&coupon_code)
-    .bind(&notify_url)
-    .fetch_one(&mut *tx)
-    .await?;
-
-    // Reserve stock per product in ascending id order, so concurrent orders
-    // touching the same products always lock rows in the same order (no deadlocks).
+    // Aggregate quantities per product (BTreeMap = ascending product id).
     let mut wanted: BTreeMap<i32, i32> = BTreeMap::new();
     for line in &lines {
         let pid = i32::try_from(line.product_id).map_err(|_| {
@@ -169,71 +156,87 @@ pub async fn create(
             .ok_or_else(|| ApiError::bad_request("quantity is too large"))?;
         wanted.insert(pid, total_qty);
     }
-    let mut prices: HashMap<i32, f64> = HashMap::with_capacity(wanted.len());
-    for (&pid, &qty) in &wanted {
-        // atomic reserve: never oversells, even under concurrent orders
-        let reserved: Option<(Option<f64>,)> = sqlx::query_as(
-            "UPDATE products SET stock = stock - $1 WHERE id = $2 AND stock >= $1 RETURNING price",
-        )
-        .bind(qty)
-        .bind(pid)
-        .fetch_optional(&mut *tx)
-        .await?;
-        match reserved {
-            Some((price,)) => {
-                prices.insert(pid, price.unwrap_or(0.0));
-            }
-            None => {
-                let sku: Option<(Option<String>,)> =
-                    sqlx::query_as("SELECT sku FROM products WHERE id = $1")
-                        .bind(pid)
-                        .fetch_optional(&mut *tx)
-                        .await?;
-                return Err(match sku {
-                    None => ApiError::not_found_msg(format!("product {pid} not found")),
-                    Some((sku,)) => ApiError::conflict(format!(
-                        "insufficient stock for {}",
-                        sku.unwrap_or_default()
-                    )),
-                });
-            }
-        }
-    }
 
-    // order lines keep the request order; one multi-row INSERT
+    // 1. Prices: a plain read, no locks. The order is charged at the price
+    //    current when it was placed.
+    let ids: Vec<i32> = wanted.keys().copied().collect();
+    let found: Vec<(i32, Option<f64>)> =
+        sqlx::query_as("SELECT id, price FROM products WHERE id = ANY($1)")
+            .bind(&ids)
+            .fetch_all(&mut *tx)
+            .await?;
+    let prices: HashMap<i32, f64> = found
+        .into_iter()
+        .map(|(id, price)| (id, price.unwrap_or(0.0)))
+        .collect();
     let mut subtotal = 0.0f64;
     let (mut item_pids, mut item_qtys, mut item_prices) = (vec![], vec![], vec![]);
     for line in &lines {
         // both conversions were validated above
         let pid = line.product_id as i32;
         let qty = line.quantity as i32;
-        let price = prices.get(&pid).copied().unwrap_or(0.0);
+        let price = *prices.get(&pid).ok_or_else(|| {
+            ApiError::not_found_msg(format!("product {} not found", line.product_id))
+        })?;
         subtotal += price * qty as f64;
         item_pids.push(pid);
         item_qtys.push(qty);
         item_prices.push(price);
     }
-    sqlx::query(
-        "INSERT INTO order_items (order_id, product_id, quantity, price) \
-         SELECT $1, * FROM UNNEST($2::int[], $3::int[], $4::float8[])",
+    let pct = coupon.as_ref().and_then(|c| c.percent).unwrap_or(0);
+    let total = calc_total(subtotal, pct);
+
+    // 2. Order + lines in one round trip. order_no comes from a sequence
+    //    (migration 002), so orders are created in parallel.
+    let order = sqlx::query_as::<_, Order>(
+        "WITH o AS ( \
+           INSERT INTO orders (order_no, user_id, status, total, paid_amount, refunded, coupon, notify_url, created_at) \
+           VALUES (nextval('orders_order_no_seq')::int, $1, 'pending', $2, 0, 0, $3, $4, (now() AT TIME ZONE 'UTC')) \
+           RETURNING *), \
+         i AS ( \
+           INSERT INTO order_items (order_id, product_id, quantity, price) \
+           SELECT o.id, u.pid, u.qty, u.price FROM o, UNNEST($5::int[], $6::int[], $7::float8[]) AS u(pid, qty, price)) \
+         SELECT * FROM o",
     )
-    .bind(oid)
+    .bind(user.id)
+    .bind(total)
+    .bind(&coupon_code)
+    .bind(&notify_url)
     .bind(&item_pids)
     .bind(&item_qtys)
     .bind(&item_prices)
-    .execute(&mut *tx)
+    .fetch_one(&mut *tx)
     .await?;
+    let (oid, order_no) = (order.id, order.order_no.unwrap_or_default());
 
-    let pct = coupon.as_ref().and_then(|c| c.percent).unwrap_or(0);
-    let total = calc_total(subtotal, pct);
-    let order =
-        sqlx::query_as::<_, Order>("UPDATE orders SET total = $1 WHERE id = $2 RETURNING *")
-            .bind(total)
-            .bind(oid)
-            .fetch_one(&mut *tx)
-            .await?;
+    // 3. Reserve stock LAST, just before commit, so a popular product's row
+    //    lock is held for one statement + commit (hot-SKU / flash-sale safe).
+    //    Ascending id order means concurrent orders never deadlock.
+    for (&pid, &qty) in &wanted {
+        let reserved =
+            sqlx::query("UPDATE products SET stock = stock - $1 WHERE id = $2 AND stock >= $1")
+                .bind(qty)
+                .bind(pid)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+        if reserved == 0 {
+            let sku: Option<(Option<String>,)> =
+                sqlx::query_as("SELECT sku FROM products WHERE id = $1")
+                    .bind(pid)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            return Err(match sku {
+                None => ApiError::not_found_msg(format!("product {pid} not found")),
+                Some((sku,)) => ApiError::conflict(format!(
+                    "insufficient stock for {}",
+                    sku.unwrap_or_default()
+                )),
+            });
+        }
+    }
     if let Some(c) = coupon.as_ref().filter(|c| !c.single_use.unwrap_or(false)) {
-        // last statement before commit, so the row lock is held only briefly
+        // also a shared hot row: touched last for the same reason
         sqlx::query("UPDATE coupons SET used_count = COALESCE(used_count, 0) + 1 WHERE id = $1")
             .bind(c.id)
             .execute(&mut *tx)

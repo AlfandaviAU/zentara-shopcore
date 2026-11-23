@@ -73,8 +73,10 @@ async fn run(cmd: &str, args: &[String]) -> anyhow::Result<()> {
 }
 
 async fn serve(cfg: Config, pool: sqlx::PgPool) -> anyhow::Result<()> {
-    // self-sufficient start: make sure tables exist even if init-db was skipped
+    // Self-sufficient start: tables and seed data exist even when the image is run
+    // directly (without the compose command). Both steps are idempotent.
     db::init_db(&pool).await?;
+    manage::seed(&pool, &cfg).await?;
     let addr = cfg.bind_addr.clone();
     let app = router(AppState::new(cfg, pool));
     let listener = tokio::net::TcpListener::bind(&addr).await?;
