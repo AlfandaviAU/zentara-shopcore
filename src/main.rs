@@ -1,5 +1,10 @@
 use std::process::ExitCode;
 
+/// mimalloc: faster than glibc malloc for many small allocations across threads,
+/// and it returns the large Argon2 buffers to the OS instead of hoarding them per arena.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use shopcore::{db, manage, router, AppState, Config};
 use tracing_subscriber::EnvFilter;
 

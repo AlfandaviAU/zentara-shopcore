@@ -21,11 +21,12 @@ use crate::AppState;
 /// Bulkhead for password hashing. Argon2id is deliberately expensive (19 MiB of
 /// memory and ~10-30 ms of CPU per call). Without a bound, a login burst spawns
 /// hundreds of blocking hashes that exhaust memory and starve the async
-/// runtime and Postgres. Capping concurrency at the CPU count keeps throughput at
+/// runtime and Postgres. Capping concurrency at half the CPU count keeps throughput at
 /// the hardware maximum, keeps memory flat, and lets every other endpoint stay fast.
 static HASH_PERMITS: LazyLock<Semaphore> = LazyLock::new(|| {
+    // half the cores: the other half keeps serving requests (and Postgres) during a login storm
     let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
-    Semaphore::new(cpus.max(2))
+    Semaphore::new((cpus / 2).max(2))
 });
 
 async fn run_hash<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> anyhow::Result<T> {
