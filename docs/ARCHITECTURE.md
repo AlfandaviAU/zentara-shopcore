@@ -125,7 +125,7 @@ Other choices that matter for speed:
 | Experiment | Result | Decision |
 |---|---|---|
 | In-process per-product lock queue plus an order bulkhead (to protect hot SKUs) | single-SKU throughput +35%, but the mixed 3× test regressed badly (create-order p95 39 s): lock convoys across multi-product orders | rolled back |
-| Reusing Argon2 memory blocks per thread | 18.2 to 15.9 ms per hash (−12%) | not worth the extra unsafe-adjacent code |
+| Reusing Argon2 memory blocks per thread | 18.2 to 15.9 ms per hash (−12%) | not worth the extra code (manual PHC-string encoding) for a 12% gain |
 | Argon2 bulkhead = all cores | logins faster, but browse and checkout latency suffered during login storms | cores/2 kept |
 | Global advisory lock for `order_no` | correct, but serialised every checkout | replaced by a sequence (D5) |
 
