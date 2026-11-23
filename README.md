@@ -93,6 +93,7 @@ docker compose exec app manage import-products /path/products.csv
 | Money invariant violations | 88 | **0** |
 | SLOs met | 0 of 6 | **6 of 6** |
 | At 3× the load | – | 7,449 req/s, 0 errors, all SLOs met |
+| At 5× the load (overload) | – | 0 errors, 0 money errors; p95 445 ms (degrades, doesn't fail) |
 
 Full results: [docs/BENCHMARKS.md](docs/BENCHMARKS.md). Design decisions and their reasons: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 

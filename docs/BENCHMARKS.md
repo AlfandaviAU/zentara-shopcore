@@ -108,6 +108,26 @@ wallet pay < 150 ms, bank pay < 400 ms, report < 500 ms.
 
 The legacy service already failed every SLO at 1×.
 
+### 2.3b Overload: 5× the mixed load (`SCALE=5`)
+
+The service saturates and degrades gracefully. It does not fail.
+
+| Metric | Result |
+|---|---|
+| Requests / errors | 779,876 / **0** |
+| Throughput | 7,483 req/s (the same plateau as 3×: the machine is full, and it also runs k6) |
+| p95 overall | 445 ms; latency SLOs are exceeded, and nothing times out |
+| Invariant violations / duplicate charges | **0 / 0**; every `order_no` is unique, and no stock is negative |
+| App memory | 749 MiB |
+
+### 2.3c Failure tests (run against the stack started from a fresh `git clone`)
+
+| Failure | Behaviour |
+|---|---|
+| Bank down | bank pay gets a clean **502 in 0.7 s** (3 attempts) and the order stays `pending`, so it can be paid later; wallet pay and browsing keep working; bank pay works again as soon as the bank is back |
+| Database restart | the pool reconnects by itself, no failed requests were observed, sessions survive (they live in Postgres), and order + pay work right after |
+| App restart | healthy again in **~50 ms**; existing login tokens stay valid |
+
 ### 2.4 Breakpoint tests: where each path breaks (`loadtest/breakpoint.js`)
 
 Each traffic class ramps over 60 s until p95 > 1 s or errors > 1%.
