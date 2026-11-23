@@ -1,0 +1,72 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: shop
+      POSTGRES_PASSWORD: shop
+      POSTGRES_DB: shop
+    command: ["postgres", "-c", "max_connections=200"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shop"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  bank:
+    build:
+      context: .
+      dockerfile: bank_sim/Dockerfile
+    environment:
+      APP_URL: http://app:8000
+      BANK_SECRET: bank-shared-secret-2019
+      BANK_LATENCY_MS: "0"
+      BANK_DROP_RATE: "0"
+    ports:
+      - "${BANK_PORT:-5001}:5001"
+
+  app:
+    build: .
+    command: sh -c "shopcore init-db && shopcore seed && exec shopcore serve"
+    environment:
+      DATABASE_URL: postgresql://shop:shop@db:5432/shop
+      BANK_URL: http://bank:5001
+      BANK_SECRET: bank-shared-secret-2019
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      bank:
+        condition: service_started
+
+  # Rust unit + integration tests inside the build image, against the db service.
+  #   docker compose --profile test run --rm test
+  test:
+    profiles: ["test"]
+    build:
+      context: .
+      target: builder
+    command: cargo test --release --locked --offline
+    environment:
+      TEST_DATABASE_URL: postgresql://shop:shop@db:5432/shop
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # Black-box parity check: the legacy smoke tests, run against this service.
+  #   docker compose --profile smoke run --rm smoke
+  smoke:
+    profiles: ["smoke"]
+    build:
+      context: .
+      dockerfile: bank_sim/Dockerfile
+    command:
+      - sh
+      - -c
+      - >-
+        for i in $(seq 1 90); do python -c "import requests;requests.get('http://app:8000/health',timeout=2).raise_for_status()" 2>/dev/null && break; sleep 1; done; pytest -q smoke
+    environment:
+      BASE_URL: http://app:8000
+    depends_on:
+      app:
+        condition: service_started
