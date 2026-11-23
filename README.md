@@ -7,6 +7,17 @@ ShopCore's order, wallet and reporting backend, migrated from Python/Flask to Ru
 - the bank settlement webhook (`POST /api/webhooks/bank`, HMAC-SHA256 signed)
 - the `manage.py` maintenance commands: `init-db`, `seed`, `import-products <csv>`, `export-sales <file>`, `purge-sessions`
 
+## Documentation
+
+| Document | Contents |
+|---|---|
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | design, every decision with its alternatives and reasons, correctness guarantees, performance work, rejected experiments, known limits |
+| [docs/API_COMPATIBILITY.md](docs/API_COMPATIBILITY.md) | endpoint-by-endpoint and command-by-command: legacy vs Rust, what changed and why |
+| [docs/TESTING.md](docs/TESTING.md) | how to run every suite, and what each of the 36 tests proves |
+| [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | test results, coverage, load tests (1×, 3×, 5×), breakpoints, failure tests, head-to-head with legacy |
+| [docs/OPERATIONS.md](docs/OPERATIONS.md) | runbook: configuration, cutover from legacy, rollback, scaling, failure behaviour, troubleshooting |
+| [docs/openapi.yaml](docs/openapi.yaml) | the public API (unchanged from legacy) |
+
 ## Build and run
 
 ```sh
@@ -22,6 +33,10 @@ If ports 8000 or 5001 are already in use: `APP_PORT=18000 BANK_PORT=15001 docker
 
 ## Tests
 
+> The legacy README ran the smoke tests *inside* the app container (`docker compose exec app pytest -q tests`).
+> The Rust image has no Python, so the same unchanged suite runs from its own container over HTTP:
+> `docker compose --profile smoke run --rm smoke`.
+
 | What | Command |
 |---|---|
 | Unit tests (no DB needed) | `cargo test` |
@@ -29,6 +44,7 @@ If ports 8000 or 5001 are already in use: `APP_PORT=18000 BANK_PORT=15001 docker
 | Integration tests from the host | `TEST_DATABASE_URL=postgresql://shop:shop@localhost:5432/shop cargo test` |
 | Legacy smoke tests against this service (black-box parity) | `docker compose --profile smoke run --rm smoke` |
 | Load test with SLO thresholds (k6) | `docker run --rm --network host -v "$PWD/loadtest:/lt" grafana/k6:0.54.0 run /lt/shopcore.js` |
+| Concurrency burst / failure injection | `python3 loadtest/burst.py http://localhost:8000 http://localhost:5001` / `python3 loadtest/chaos.py` |
 | Breakpoint (ramp until it breaks) | same image, `-e MODE=read\|auth\|login\|order` and `/lt/breakpoint.js` |
 
 The integration tests (`tests/api.rs`) start the real router and a mock bank in-process.
@@ -165,8 +181,9 @@ src/main.rs        CLI: serve + maintenance commands
 src/routes/        HTTP handlers (users, products, orders, payments, wallet, reports, admin, webhooks)
 src/auth.rs        password hashing, sessions, CurrentUser / AdminUser extractors
 src/db.rs          schema + additive migrations, connection with retry
-loadtest/          k6 load test (SLO thresholds + invariant checks)
-docs/              ARCHITECTURE.md, BENCHMARKS.md, openapi.yaml
+loadtest/          k6 mixed load + breakpoints, burst and failure-injection scripts
+docs/              architecture, API compatibility, testing, benchmarks, operations, openapi.yaml
+docker/            manage.py / python compatibility shims for the image
 src/bank.rs        idempotent bank client
 src/notify.rs      background webhooks / e-mails
 src/manage.rs      seed, import, export, purge

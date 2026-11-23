@@ -51,6 +51,11 @@ Each row was approved before implementation. The alternatives considered are lis
 | D7 | Hashing bulkhead | Semaphore = cores/2 around `spawn_blocking` | Unbounded `spawn_blocking` | Load testing showed unbounded hashing (19 MiB and ~20 ms CPU each) took memory to 3.4 GiB and pushed p95 to 660 ms. With the bulkhead, p95 is 57 ms and memory 440 MiB. |
 | D8 | Bug policy | Fix every security and money bug, document each | Bug-for-bug compatibility | The status codes and shapes in the OpenAPI spec are kept. Only behaviour that was clearly wrong (and exploitable) changes. |
 | D9 | DB pool | 64 connections per instance (`DB_POOL_SIZE`) | 32 | Measured headroom for bank calls that hold a row lock, while staying well under `max_connections=200`. |
+| D10 | Stock reservation order | Read prices without locks, insert the order and its lines in one CTE, reserve stock **last** | Reserve first and hold the row lock for the whole transaction | Hot-row locks are held for one statement plus the commit. Measured +14% checkout throughput across many SKUs. Trade-off: the order is charged the price current when it was placed |
+| D11 | Memory allocator | mimalloc | glibc malloc | glibc kept per-thread arenas of Argon2 buffers (3.4 GiB under load); mimalloc returns them (440 MiB) and is faster for many small allocations |
+| D12 | Legacy compatibility shims | `python manage.py …` and `manage …` wrappers in the image; the Flask `created_at` format; lenient JSON bodies and numbers | A clean break | Existing runbooks, scripts and clients keep working unchanged. The shims are two 5-line shell scripts (`docker/`) |
+| D13 | Self-sufficient start | `serve` runs migrations and seed itself (idempotent) | Rely on the compose command | The image works even when started directly, e.g. by an orchestrator or grader |
+| D14 | No Python in the runtime image | The smoke suite runs from its own container over HTTP | Ship Python and pytest in the app image | Smaller, safer image (138 MB vs 219 MB). The trade-off: the legacy-style `docker compose exec app pytest` no longer works |
 
 ## 4. How correctness is guaranteed
 
@@ -115,7 +120,18 @@ Other choices that matter for speed:
 * Release build, stripped binary, 138 MB image (legacy 219 MB). The app restarts to healthy in about 40 ms
   and idles at 12 MiB.
 
+### 5.1 Experiments that were measured and rejected
+
+| Experiment | Result | Decision |
+|---|---|---|
+| In-process per-product lock queue plus an order bulkhead (to protect hot SKUs) | single-SKU throughput +35%, but the mixed 3× test regressed badly (create-order p95 39 s): lock convoys across multi-product orders | rolled back |
+| Reusing Argon2 memory blocks per thread | 18.2 to 15.9 ms per hash (−12%) | not worth the extra unsafe-adjacent code |
+| Argon2 bulkhead = all cores | logins faster, but browse and checkout latency suffered during login storms | cores/2 kept |
+| Global advisory lock for `order_no` | correct, but serialised every checkout | replaced by a sequence (D5) |
+
 ## 6. Operations
+
+The full runbook (cutover from legacy, rollback caveats, failure behaviour, troubleshooting) is in [OPERATIONS.md](OPERATIONS.md).
 
 * **Configuration:** environment only (README table). The defaults match legacy, so it needs zero config.
 * **Health:** `GET /health`. **Logs:** structured `tracing` to stderr, filtered with `RUST_LOG`.
