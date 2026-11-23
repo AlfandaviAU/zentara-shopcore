@@ -84,11 +84,26 @@ CREATE INDEX IF NOT EXISTS order_items_order_id_idx ON order_items (order_id);
 CREATE INDEX IF NOT EXISTS payments_order_id_idx ON payments (order_id);
 "#;
 
+/// Additive migration 002: `order_no` from a sequence instead of a locked
+/// `MAX(order_no) + 1`, so orders are created in parallel. The sequence is
+/// (re)aligned to the current maximum on every `init-db`, so numbering
+/// continues from existing data (first order on an empty table is 1001).
+pub const MIGRATION_002: &str = r#"
+CREATE SEQUENCE IF NOT EXISTS orders_order_no_seq;
+SELECT setval(
+    'orders_order_no_seq',
+    GREATEST(
+        COALESCE((SELECT MAX(order_no) FROM orders), 1000),
+        (SELECT CASE WHEN is_called THEN last_value ELSE 1000 END FROM orders_order_no_seq)
+    ),
+    true
+);
+"#;
+
 /// Advisory lock ids used to serialise the few operations that need it.
 pub mod locks {
     pub const SCHEMA: i64 = 7_100_000;
     pub const USERS: i64 = 7_100_001;
-    pub const ORDER_NO: i64 = 7_100_002;
 }
 
 /// Connect, retrying for up to ~60s so the service survives a slow database start.
@@ -132,6 +147,10 @@ pub async fn init_db(pool: &PgPool) -> anyhow::Result<()> {
         .execute(&mut *tx)
         .await
         .context("migration 001")?;
+    sqlx::raw_sql(MIGRATION_002)
+        .execute(&mut *tx)
+        .await
+        .context("migration 002")?;
     tx.commit().await?;
     Ok(())
 }

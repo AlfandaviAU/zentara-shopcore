@@ -59,7 +59,7 @@ docker compose exec app manage import-products /path/products.csv
 | `EXPORT_DIR` | `/tmp/exports` | Where report exports are written |
 | `BIND_ADDR` | `0.0.0.0:8000` | Listen address |
 | `SESSION_TTL_HOURS` | `24` | Bearer token lifetime |
-| `DB_POOL_SIZE` | `32` | Max Postgres connections |
+| `DB_POOL_SIZE` | `64` | Max Postgres connections |
 | `RUST_LOG` | `info,sqlx=warn` | Log filter |
 
 ## Design

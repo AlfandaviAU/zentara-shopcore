@@ -13,6 +13,7 @@ async fn main() -> ExitCode {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,sqlx=warn")),
         )
         .with_writer(std::io::stderr)
+        .with_ansi(false)
         .init();
 
     let args: Vec<String> = std::env::args().skip(1).collect();

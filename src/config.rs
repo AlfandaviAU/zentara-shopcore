@@ -49,7 +49,7 @@ impl Config {
             session_ttl_hours: env_num("SESSION_TTL_HOURS", 24.0),
             bank_timeout: Duration::from_millis(env_num("BANK_TIMEOUT_MS", 15_000)),
             bank_attempts: env_num("BANK_ATTEMPTS", 3u32).max(1),
-            db_pool_size: env_num("DB_POOL_SIZE", 32u32).max(2),
+            db_pool_size: env_num("DB_POOL_SIZE", 64u32).max(2),
         }
     }
 }

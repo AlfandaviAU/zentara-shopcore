@@ -81,7 +81,7 @@ async fn access_log(req: Request, next: Next) -> Response {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let res = next.run(req).await;
-    tracing::info!(target: "shopcore::http", %method, path, status = res.status().as_u16(), ms = start.elapsed().as_millis() as u64);
+    tracing::debug!(target: "shopcore::http", %method, path, status = res.status().as_u16(), ms = start.elapsed().as_millis() as u64);
     res
 }
 

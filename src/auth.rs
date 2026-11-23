@@ -1,5 +1,7 @@
 //! Passwords, sessions and the request extractors for authenticated routes.
 
+use std::sync::LazyLock;
+
 use anyhow::anyhow;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
@@ -10,14 +12,30 @@ use md5::{Digest as _, Md5};
 use rand::RngCore;
 use sha2::Sha256;
 use sqlx::PgPool;
+use tokio::sync::Semaphore;
 
 use crate::error::ApiError;
 use crate::models::User;
 use crate::AppState;
 
+/// Bulkhead for password hashing. Argon2id is deliberately expensive (19 MiB of
+/// memory and ~10-30 ms of CPU per call). Without a bound, a login burst spawns
+/// hundreds of blocking hashes that exhaust memory and starve the async
+/// runtime and Postgres. Capping concurrency at the CPU count keeps throughput at
+/// the hardware maximum, keeps memory flat, and lets every other endpoint stay fast.
+static HASH_PERMITS: LazyLock<Semaphore> = LazyLock::new(|| {
+    let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
+    Semaphore::new(cpus.max(2))
+});
+
+async fn run_hash<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> anyhow::Result<T> {
+    let _permit = HASH_PERMITS.acquire().await?;
+    Ok(tokio::task::spawn_blocking(f).await?)
+}
+
 /// Hash a password with Argon2id (the legacy service used unsalted MD5).
 pub async fn hash_password(password: String) -> anyhow::Result<String> {
-    tokio::task::spawn_blocking(move || {
+    run_hash(move || {
         let mut salt = [0u8; 16];
         rand::rngs::OsRng.fill_bytes(&mut salt);
         let salt = SaltString::encode_b64(&salt).map_err(|e| anyhow!("salt: {e}"))?;
@@ -65,7 +83,7 @@ pub fn verify_password_sync(password: &str, stored: &str) -> Verified {
 }
 
 pub async fn verify_password(password: String, stored: String) -> anyhow::Result<Verified> {
-    Ok(tokio::task::spawn_blocking(move || verify_password_sync(&password, &stored)).await?)
+    run_hash(move || verify_password_sync(&password, &stored)).await
 }
 
 /// Constant-time byte comparison.
