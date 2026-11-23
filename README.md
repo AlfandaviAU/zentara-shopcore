@@ -27,6 +27,7 @@ If ports 8000 or 5001 are already in use: `APP_PORT=18000 BANK_PORT=15001 docker
 | Unit + integration tests (real Postgres, in Docker) | `docker compose --profile test run --rm test` |
 | Integration tests from the host | `TEST_DATABASE_URL=postgresql://shop:shop@localhost:5432/shop cargo test` |
 | Legacy smoke tests against this service (black-box parity) | `docker compose --profile smoke run --rm smoke` |
+| Load test with SLO thresholds (k6) | `docker run --rm --network host -v "$PWD/loadtest:/lt" grafana/k6:0.54.0 run /lt/shopcore.js` |
 
 The integration tests (`tests/api.rs`) start the real router and a mock bank in-process.
 The mock bank drops the first answer to every charge. They cover concurrent orders
@@ -70,7 +71,7 @@ docker compose exec app manage import-products /path/products.csv
   - wallet debits are conditional updates, and money is rounded to cents in `numeric`
   - pay, cancel, refund and webhook take a `SELECT … FOR UPDATE` lock on the order
   - transfers lock both wallets in id order, so they cannot deadlock
-  - order creation is one transaction, serialised by an advisory lock because `order_no` is `MAX+1`
+  - order creation is one transaction; `order_no` comes from a sequence, and stock is reserved in product-id order, so there are no deadlocks
 - **Bank charges are idempotent.** Every pay attempt sends one `Idempotency-Key`, reused across retries.
 - **Background work runs as in-process tokio tasks:** `notify_url` webhooks and e-mails (written to the log).
   Deliveries for one order are chained, so `pending` always arrives before `paid`.
@@ -79,13 +80,17 @@ docker compose exec app manage import-products /path/products.csv
 - **Errors** are always `{"error": "..."}`, including unknown routes (404) and wrong methods (405).
   Stack traces are never sent to clients.
 
-Measured locally on the full stack: 200 concurrent order+bank-pay flows, with the bank dropping 30% of
-responses and 150 units in stock.
+### Performance (same k6 mixed-traffic test, same machine)
 
-| | Time | Orders accepted | Duplicate bank charges |
-|---|---|---|---|
-| Rust | 0.8 s | exactly 150 | 0 |
-| Legacy | 8.3 s | 200, stock counter corrupted | 51 |
+| | Legacy | Rust |
+|---|---|---|
+| Throughput | 710 req/s | **2,940 req/s** (4.1x) |
+| p95 latency | 6.21 s | **57 ms** (~109x) |
+| Duplicate bank charges | 87 | **0** |
+| Money invariant violations | 88 | **0** |
+| SLOs met | 0 of 6 | **6 of 6** |
+
+Full results: [docs/BENCHMARKS.md](docs/BENCHMARKS.md). Design decisions and their reasons: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Database changes
 
@@ -95,7 +100,12 @@ The legacy schema is unchanged. `init-db` applies one **additive** migration (`M
 - lookup indexes on existing columns (`users.username`, `users.email`, `products.sku`, `coupons.code`,
   `orders.user_id`, `orders.created_at`, `order_items.order_id`, `payments.order_id`)
 
-Nothing is altered or dropped, so the legacy service can still run against the same database.
+Migration 002 (`MIGRATION_002`) adds a sequence `orders_order_no_seq` for `order_no`, aligned to the
+current `MAX(order_no)` on every `init-db`, so numbering continues and the first order is 1001. Order
+creation no longer has to be serialised. Rolled-back orders leave gaps, but numbers stay unique and increasing.
+
+Nothing is altered or dropped. Do not run the legacy service against the same database at the same time,
+because it still computes `MAX+1`.
 
 ## Behaviour deliberately changed (legacy bugs fixed)
 
@@ -126,7 +136,7 @@ Nothing is altered or dropped, so the legacy service can still run against the s
 14. Negative or zero quantities reduced the price and increased stock; they now get 400.
     A failed order (unknown product, no stock) no longer leaves a half-created order with stock reserved.
 15. Admin-set `shipped` on an unpaid order, followed by cancel, credited money that was never paid. Fixed by crediting from `paid_amount`.
-16. A duplicate `order_no` was possible under concurrency (`MAX+1` with no lock). Order creation is now serialised.
+16. A duplicate `order_no` was possible under concurrency (`MAX+1` with no lock). It now comes from a sequence (migration 002).
 17. `POST /api/admin/orders/{id}/status` and `/role` accepted any value. They are now limited to the OpenAPI enums (400 otherwise).
 
 **Other**
@@ -149,7 +159,9 @@ Nothing is altered or dropped, so the legacy service can still run against the s
 src/main.rs        CLI: serve + maintenance commands
 src/routes/        HTTP handlers (users, products, orders, payments, wallet, reports, admin, webhooks)
 src/auth.rs        password hashing, sessions, CurrentUser / AdminUser extractors
-src/db.rs          schema + additive migration, connection with retry
+src/db.rs          schema + additive migrations, connection with retry
+loadtest/          k6 load test (SLO thresholds + invariant checks)
+docs/              ARCHITECTURE.md, BENCHMARKS.md, openapi.yaml
 src/bank.rs        idempotent bank client
 src/notify.rs      background webhooks / e-mails
 src/manage.rs      seed, import, export, purge
