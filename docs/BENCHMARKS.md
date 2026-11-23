@@ -10,9 +10,22 @@ the same host, so absolute numbers are conservative. Legacy and Rust were run on
 | Suite | Command | Result |
 |---|---|---|
 | Unit tests (pricing, rounding parity with Python, parsing, hashing, signatures, CSV, file names) | `cargo test` | **14 / 14 pass** |
-| Integration tests (real router and Postgres, mock bank that drops the first answer) | `docker compose --profile test run --rm test` | **11 / 11 pass** |
+| API integration tests (real router and Postgres, mock bank, webhook receiver) | `docker compose --profile test run --rm test` | **19 / 19 pass** |
+| CLI tests (the real binary: every maintenance command, plus `serve` with graceful SIGTERM) | same | **3 / 3 pass** |
 | Legacy smoke tests, unchanged, run black-box against the Rust service | `docker compose --profile smoke run --rm smoke` | **15 / 15 pass** |
 | `cargo clippy --all-targets` | | 0 warnings |
+| Clean-checkout build (`git clone` and `docker build --no-cache`) | | pass |
+
+### Code coverage (`cargo llvm-cov`, all suites)
+
+| | Lines | Functions | Regions |
+|---|---|---|---|
+| Before the coverage work | 69.6% | 69.4% | 66.8% |
+| **Now** | **95.3%** | **95.0%** | **91.4%** |
+
+Every route module is at 96–100% of lines, and `main.rs` (the CLI) is at 97%. The remaining uncovered lines are
+infrastructure-failure paths (the database staying unreachable for 60 s, panics in the panic handler, unreadable bank responses).
+Reproduce with `TEST_DATABASE_URL=… cargo llvm-cov --summary-only`.
 
 The integration tests cover:
 * 20 concurrent orders for 5 units: exactly 5 succeed, stock ends at 0, and every `order_no` is unique
@@ -80,6 +93,42 @@ wallet pay < 150 ms, bank pay < 400 ms, report < 500 ms.
 | Stock counter afterwards | 135 (corrupted by lost updates) | **0 (exact)** |
 | Bank charges | 267 for 198 orders (51 orders charged twice) | **150 for 150 orders** |
 
+### 2.3 Scaling beyond the target: 3× the mixed load (`SCALE=3`)
+
+| Metric | Result |
+|---|---|
+| Requests | 773,565 in ~100 s |
+| Throughput | **7,449 req/s** |
+| HTTP errors | **0** |
+| p95 overall / browse / account | 41.8 ms / 27.2 ms / 50.6 ms |
+| p95 create order / wallet pay / bank pay / report | 73.9 ms / 40.7 ms / 334 ms / 162 ms |
+| SLO thresholds | **6 of 6 met** |
+| Invariant violations / duplicate bank charges | **0 / 0** |
+| Database checks afterwards | every `order_no` unique, no negative stock |
+
+The legacy service already failed every SLO at 1×.
+
+### 2.4 Breakpoint tests: where each path breaks (`loadtest/breakpoint.js`)
+
+Each traffic class ramps over 60 s until p95 > 1 s or errors > 1%.
+
+| Path | Ceiling on this machine | What limits it |
+|---|---|---|
+| Anonymous reads (`MODE=read`) | **20,500 req/s**, p95 35 ms, 0 errors (not broken) | the k6 load generator on the same host ran out of CPU first |
+| Order + wallet pay over 200 SKUs (`MODE=order SKUS=200`) | **2,678 flows/s** (5,368 req/s), 0 errors | Postgres write throughput (WAL flush) |
+| Register (`MODE=login`) | **~265/s** | Argon2id hashing, CPU- and memory-bound by design (~16 ms and 19 MiB per hash) |
+| Order + pay on **one** SKU (`MODE=order SKUS=1`, flash sale) | **~100–135 flows/s** | every order for that product updates the same stock row, so commits are serialised |
+
+What these mean:
+* **Reads and normal checkout scale far beyond the target load.**
+* **Login rate** is bounded by deliberate password-hashing cost. Raising it means more cores or replicas,
+  or weaker hashing parameters, which is a security decision and was not taken.
+* **A single hot SKU** is the one real ceiling: about 100 orders/s on one product. Reserving stock as the last step before
+  commit improved spread-out order throughput by 14% (2,351 to 2,678/s), but a single row is bounded by
+  commit latency (WAL flush, ~1.4 ms on this Docker VM). An in-process per-product lock queue was tried and
+  **rolled back**: it made the mixed test worse (lock convoys across multi-product orders). Options for flash sales are
+  listed in ARCHITECTURE.md §7; each needs a design decision (schema, infrastructure or durability).
+
 ## 3. Resource footprint
 
 | | Legacy | Rust |
@@ -101,6 +150,7 @@ work per login, the Rust service handles 4× the throughput.
 | v2 | 662 ms | 1.07 s | 3.7 GiB | sequence-based `order_no` (the lock bottleneck moved to hashing) |
 | v3 | 198 ms | 328 ms | 3.4 GiB | Argon2 bulkhead, access log at debug |
 | v4 | **57 ms** | **15.8 ms** | **440 MiB** | mimalloc, bulkhead = cores/2 |
+| v5 | 57 ms at 1×; 41.8 ms p95 at **3×** | 73.9 ms at 3× | – | stock reserved last, one-statement order insert |
 
 ## 5. How to reproduce
 
@@ -112,4 +162,5 @@ docker run --rm --network host -v "$PWD/loadtest:/lt" grafana/k6:0.54.0 run /lt/
 ```
 
 To compare, stop this stack, start the legacy stack (`docker compose up -d --build` in the legacy folder), and rerun the k6 command.
-`SCALE=2` doubles every arrival rate.
+`SCALE=2` doubles every arrival rate. Breakpoints: `docker run --rm --network host -e MODE=read -v "$PWD/loadtest:/lt" grafana/k6:0.54.0 run /lt/breakpoint.js`
+(the modes are `read`, `auth`, `login` and `order`; `SKUS=N` spreads orders over N products).

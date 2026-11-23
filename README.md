@@ -25,17 +25,19 @@ If ports 8000 or 5001 are already in use: `APP_PORT=18000 BANK_PORT=15001 docker
 | What | Command |
 |---|---|
 | Unit tests (no DB needed) | `cargo test` |
-| Unit + integration tests (real Postgres, in Docker) | `docker compose --profile test run --rm test` |
+| **All 36 tests**: unit, API integration, CLI (real Postgres, in Docker) | `docker compose --profile test run --rm test` |
 | Integration tests from the host | `TEST_DATABASE_URL=postgresql://shop:shop@localhost:5432/shop cargo test` |
 | Legacy smoke tests against this service (black-box parity) | `docker compose --profile smoke run --rm smoke` |
 | Load test with SLO thresholds (k6) | `docker run --rm --network host -v "$PWD/loadtest:/lt" grafana/k6:0.54.0 run /lt/shopcore.js` |
+| Breakpoint (ramp until it breaks) | same image, `-e MODE=read\|auth\|login\|order` and `/lt/breakpoint.js` |
 
 The integration tests (`tests/api.rs`) start the real router and a mock bank in-process.
 The mock bank drops the first answer to every charge. They cover concurrent orders
 (no overselling, unique `order_no`), concurrent payments (charged once), bank retry
 idempotency, webhook signatures, refund limits, order privacy, wallet validation,
 SQL injection, path traversal and report freshness.
-Without a database URL the integration tests skip themselves.
+`tests/cli.rs` runs the real binary for every maintenance command and for `serve`, including graceful shutdown.
+Without a database URL the integration tests skip themselves. Line coverage is 95% (`cargo llvm-cov`, see docs/BENCHMARKS.md).
 
 ## Maintenance commands
 
@@ -90,6 +92,7 @@ docker compose exec app manage import-products /path/products.csv
 | Duplicate bank charges | 87 | **0** |
 | Money invariant violations | 88 | **0** |
 | SLOs met | 0 of 6 | **6 of 6** |
+| At 3× the load | – | 7,449 req/s, 0 errors, all SLOs met |
 
 Full results: [docs/BENCHMARKS.md](docs/BENCHMARKS.md). Design decisions and their reasons: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -166,7 +169,8 @@ docs/              ARCHITECTURE.md, BENCHMARKS.md, openapi.yaml
 src/bank.rs        idempotent bank client
 src/notify.rs      background webhooks / e-mails
 src/manage.rs      seed, import, export, purge
-tests/api.rs       integration tests (real Postgres + mock bank)
+tests/api.rs       API integration tests (real Postgres + mock bank + webhook receiver)
+tests/cli.rs       maintenance commands and serve, run as the real binary
 smoke/             legacy smoke tests (black-box parity)
 bank_sim/          bank simulator from the legacy repo
 ```

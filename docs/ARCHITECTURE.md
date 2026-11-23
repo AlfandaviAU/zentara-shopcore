@@ -61,6 +61,7 @@ Each row was approved before implementation. The alternatives considered are lis
 | Reserve stock | `UPDATE products SET stock = stock - $q WHERE id = $p AND stock >= $q RETURNING price`. Under concurrency only the orders that fit succeed; the rest get 409. |
 | Lock ordering | Checkout reserves products in **ascending id order** (duplicates aggregated). Cancel locks its products `ORDER BY id FOR UPDATE`. A consistent lock order means no deadlocks. |
 | Whole order is atomic | One transaction from coupon claim to the last item. An unknown product or out-of-stock line rolls back everything (legacy left half-created orders and reserved stock). |
+| Short hot-row locks | Prices are read without a lock. The order and its lines are inserted in **one** CTE statement. Stock rows (and the shared coupon row) are updated **last**, just before commit, so a popular product's lock is held for one statement plus the commit. The order is charged the price current when it was placed. |
 | Pay | `SELECT … FOR UPDATE` on the order. A concurrent second pay waits, then sees `paid` and gets 409. The wallet debit is a conditional `UPDATE … WHERE balance >= total`. |
 | Wallet arithmetic | `round((balance ± $x)::numeric, 2)::float8` in SQL, done atomically. Cent rounding prevents float drift (e.g. `0.1 + 0.2` gives `0.3`). |
 | Transfer | Both wallets locked in id order (no deadlock). Self-transfers and non-positive amounts are rejected. |
@@ -99,6 +100,8 @@ What was measured, what was changed, and the effect at the same offered load (se
 | 2 | Global `order_no` lock queues transactions and starves the pool | Sequence (D5), sorted stock reservation, coupon not locked | 662 ms* | 3.7 GiB |
 | 3 | Unbounded Argon2 saturates CPU and memory | Bulkhead semaphore (D7), access log moved to debug | 198 ms | 3.4 GiB |
 | 4 | glibc arenas hoard Argon2 buffers; hashing competes with serving | mimalloc, bulkhead = cores/2 | **57 ms** | **440 MiB** |
+| 5 | Hot-row lock held for the whole order transaction | Stock reserved last, single-statement order insert | 41.8 ms **at 3× load** | – |
+| (rolled back) | Many waiters on one product row | In-process per-product lock queue plus an order bulkhead | worse: lock convoys on multi-product orders | – |
 
 \* Removing the lock moved the queue to the next bottleneck (CPU and memory in hashing). This is why the work
 was driven by measurement, not by guessing.
@@ -127,8 +130,12 @@ Other choices that matter for speed:
 
 ## 7. Known limits and next steps
 
+Measured ceilings are in BENCHMARKS.md §2.4. Reads reach at least 20,500 req/s, and order+pay over many SKUs about 2,700/s.
+
 | Limit | Next step |
 |---|---|
+| A **single hot SKU** caps at ~100–135 orders/s (one stock row, serialised commits) | Each option needs a decision. Inventory buckets (split a product's stock over N rows; schema change). Reserve stock in Redis with Postgres reconciliation (new infrastructure). Batch reservations per SKU (more complex). `synchronous_commit=off` (faster, but can lose the last moments of committed orders on a crash; not recommended for money). |
+| Register/login ~265/s per box, bounded by Argon2id by design | Scale out replicas; keep the OWASP parameters |
 | Notifications are not durable across crashes | Transactional outbox table and worker |
 | `notify_url` can target internal addresses (SSRF) | Allow-list or egress proxy for webhooks |
 | Money is stored as `DOUBLE PRECISION` (legacy schema) | Migrate to `NUMERIC(12,2)` or integer cents in a dedicated migration |
